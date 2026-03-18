@@ -1,0 +1,95 @@
+name: Update bureau data
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch CSV and generate data.json
+        run: |
+          python3 << 'PYEOF2'
+          import csv, re, json, io, urllib.request
+
+          URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vQb6cYJyF8leoIASCx3SnpaZAJyhmV3easzUYoRfo5LQ9-VKZudCfJz94scDoveEQ/pub?gid=150731932&single=true&output=csv"
+          import time
+          raw = None
+          for attempt in range(3):
+              try:
+                  req = urllib.request.Request(URL, headers={'User-Agent': 'Mozilla/5.0'})
+                  raw = urllib.request.urlopen(req, timeout=30).read().decode('utf-8')
+                  break
+              except Exception as ex:
+                  print(f"Attempt {attempt+1} failed: {ex}")
+                  if attempt < 2: time.sleep(10)
+          if raw is None:
+              print("All attempts failed — keeping existing data.json")
+              exit(0)
+          reader = csv.reader(io.StringIO(raw))
+          rows = list(reader)
+          while rows and all(c.strip()=='' for c in rows[0]):
+              rows.pop(0)
+          headers = [h.strip().lower() for h in rows[0]]
+
+          def col(row, kw):
+              for i,h in enumerate(headers):
+                  if kw in h and i < len(row): return row[i].strip()
+              return ''
+
+          offices = []
+          for row in rows[1:]:
+              if len(row) < 8: continue
+              dispo = col(row,'dispo').upper()
+              if 'TRUE' not in dispo and 'VRAI' not in dispo: continue
+              prix_raw = col(row,'prix')
+              prix = int(re.sub(r'[^0-9]', '', prix_raw.replace('\u202f','').replace('\xa0',''))) if re.sub(r'[^0-9]', '', prix_raw) else 0
+              if not prix or prix > 500000: continue
+              cap_raw = col(row,'capacit')
+              cap = int(cap_raw) if cap_raw.isdigit() else 0
+              etage_raw = col(row,'\u00e9tage') or col(row,'tage')
+              etage = int(etage_raw) if etage_raw.lstrip('-').isdigit() else 0
+              site_raw = col(row,'site')
+              site = 'IV' if 'IV' in site_raw else 'III' if 'III' in site_raw else 'II' if 'II' in site_raw else 'I'
+              surf_raw = col(row,'m\u00b2')
+              surface = float(re.sub(r'[^0-9,.]','',surf_raw).replace(',','.')) if surf_raw else None
+              date_raw = col(row,'lib\u00e9ration') or col(row,'liberation')
+              date_norm = None
+              if date_raw and len(date_raw) >= 8:
+                  dp = date_raw.split('/')
+                  if len(dp)==3: date_norm = dp[2]+'-'+dp[1].zfill(2)+'-'+dp[0].zfill(2)
+              desc_raw = col(row,'description (fr)') or col(row,'description')
+              desc = re.sub(r'\s+',' ', desc_raw).strip()[:500]
+              desc_en_raw = col(row,'description (en)')
+              desc_en = re.sub(r'\s+',' ', desc_en_raw).strip()[:500] if desc_en_raw else ''
+              offices.append({
+                  'site':site,'label':site_raw,'adresse':col(row,'adresse'),
+                  'etage':etage,'ref':col(row,'bureau'),'surface':surface,
+                  'cap':cap,'prix':prix,'dispo':'future' if date_norm else 'immediate',
+                  'date':date_norm,'desc':desc,'descEN':desc_en,'plateau':False
+              })
+          with open('data.json','w') as f:
+              json.dump(offices, f, ensure_ascii=False)
+          from datetime import datetime, timezone
+          with open('updated_at.txt','w') as f:
+              f.write(datetime.now(timezone.utc).isoformat())
+          print(f"Generated data.json with {len(offices)} bureaux")
+          PYEOF2
+
+      - name: Commit data.json if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          touch updated_at.txt
+          git add data.json updated_at.txt
+          git diff --cached --quiet && echo 'No changes' && exit 0
+          git commit -m "Update disponibilites $(date -u '+%Y-%m-%d %H:%M UTC')"
+          git pull --rebase origin main
+          git push
